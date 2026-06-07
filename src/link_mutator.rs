@@ -34,10 +34,41 @@ pub fn type_declarations_from_source(code: &str) -> Result<Vec<ExportedTypeDecla
 }
 
 fn should_keep_default_type(type_info: &TypeInfo, resolved_types: &[String]) -> bool {
-    // TODO: we could be more clever here, but for now we keep it simple
     match type_info {
+        // Builtin or known types: `any`, `string`, `T`, etc.
         TypeInfo::Basic(name) => resolved_types.contains(&name.token().to_string()),
-        TypeInfo::Boolean(_) => true,
+        // Singleton literals: `true`, `false`, `"hello"`
+        TypeInfo::Boolean(_) | TypeInfo::String(_) => true,
+        // Optional: `string?` — keep if inner type is known
+        TypeInfo::Optional { base, .. } => should_keep_default_type(base, resolved_types),
+        // Variadic: `...any`, `...string` — keep if inner type is known
+        TypeInfo::Variadic { type_info, .. } => should_keep_default_type(type_info, resolved_types),
+        // Union: `string | number` — keep if all branches are known
+        TypeInfo::Union(union) => union
+            .types()
+            .iter()
+            .all(|t| should_keep_default_type(t, resolved_types)),
+        // Intersection: `string & number` — keep if all branches are known
+        TypeInfo::Intersection(intersection) => intersection
+            .types()
+            .iter()
+            .all(|t| should_keep_default_type(t, resolved_types)),
+        // Generic: `map<string, number>` — keep if base and all params are known
+        TypeInfo::Generic { base, generics, .. } => {
+            resolved_types.contains(&base.token().to_string())
+                && generics
+                    .iter()
+                    .all(|t| should_keep_default_type(t, resolved_types))
+        }
+        // Tuple: `(string, number)` — keep if all elements are known
+        TypeInfo::Tuple { types, .. } => types
+            .iter()
+            .all(|t| should_keep_default_type(t, resolved_types)),
+        // Array: `{ number }` — keep if inner type is known
+        TypeInfo::Array { type_info, .. } => should_keep_default_type(type_info, resolved_types),
+        // Callback: `(string) -> number` — always safe to keep (self-contained)
+        TypeInfo::Callback { .. } => true,
+        // Everything else (Module, Table, Typeof, VariadicPack, GenericPack) — drop to be safe
         _ => false,
     }
 }
@@ -339,6 +370,24 @@ mod tests {
     }
 
     #[test]
+    fn re_exports_variadic_generic_defaults() {
+        let code = r"
+            export type Remote<Args... = ...any> = Types.Remote<Args...>
+        ";
+
+        let type_declarations = type_declarations_from_source(code).unwrap();
+        assert_eq!(type_declarations.len(), 1);
+
+        let reexported_type_declarations = re_export_type_declarations(type_declarations);
+        assert_eq!(reexported_type_declarations.len(), 1);
+
+        assert_eq!(
+            reexported_type_declarations[0].0.to_string(),
+            "export type Remote<Args... = ...any> = REQUIRED_MODULE.Remote<Args... >"
+        );
+    }
+
+    #[test]
     fn strips_earlier_defaults_when_later_param_has_unknown_default() {
         let code = r"
             export type Producer<State = any, Dispatchers = ExternalType> = Types.Producer<State, Dispatchers>
@@ -354,5 +403,50 @@ mod tests {
             reexported_type_declarations[0].0.to_string(),
             "export type Producer<State , Dispatchers > = REQUIRED_MODULE.Producer<State , Dispatchers >"
         );
+    }
+}
+
+#[cfg(test)]
+mod extra_tests {
+    use super::*;
+
+    #[test]
+    fn test_optional_default() {
+        let code = r"
+            export type Value<T = string?> = Types.Value<T>
+        ";
+        let type_declarations = type_declarations_from_source(code).unwrap();
+        let reexported = re_export_type_declarations(type_declarations);
+        println!("Optional: {}", reexported[0].0.to_string());
+    }
+
+    #[test]
+    fn test_union_default() {
+        let code = r"
+            export type Value<T = string | number> = Types.Value<T>
+        ";
+        let type_declarations = type_declarations_from_source(code).unwrap();
+        let reexported = re_export_type_declarations(type_declarations);
+        println!("Union: {}", reexported[0].0.to_string());
+    }
+
+    #[test]
+    fn test_variadic_pack_default() {
+        let code = r"
+            export type Value<T... = ...string> = Types.Value<T...>
+        ";
+        let type_declarations = type_declarations_from_source(code).unwrap();
+        let reexported = re_export_type_declarations(type_declarations);
+        println!("VariadicPack: {}", reexported[0].0.to_string());
+    }
+
+    #[test]
+    fn test_multiple_variadic_defaults() {
+        let code = r"
+            export type AsyncRemote<Args... = ...any, Returns... = ...any> = Types.AsyncRemote<Args..., Returns...>
+        ";
+        let type_declarations = type_declarations_from_source(code).unwrap();
+        let reexported = re_export_type_declarations(type_declarations);
+        println!("MultiVariadic: {}", reexported[0].0.to_string());
     }
 }
