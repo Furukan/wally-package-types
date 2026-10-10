@@ -2,18 +2,24 @@ use anyhow::{bail, Result};
 use full_moon::{
     ast::{
         luau::{
-            ExportedTypeDeclaration, GenericDeclaration, GenericDeclarationParameter,
-            GenericParameterInfo, IndexedTypeInfo, TypeInfo,
+            ExportedTypeDeclaration, ExportedTypeFunction, GenericDeclaration,
+            GenericDeclarationParameter, GenericParameterInfo, IndexedTypeInfo, TypeDeclaration,
+            TypeInfo,
         },
         punctuated::{Pair, Punctuated},
         span::ContainedSpan,
-        Ast, Expression, LastStmt, LocalAssignment, Return, Stmt,
+        Ast, Expression, LastStmt, LocalAssignment, Parameter, Return, Stmt,
     },
     tokenizer::{Token, TokenReference, TokenType},
 };
 
-/// Finds all exported type declarations from a give source file
-pub fn type_declarations_from_source(code: &str) -> Result<Vec<ExportedTypeDeclaration>> {
+pub enum ExportedTypeKind {
+    Declaration(Box<ExportedTypeDeclaration>),
+    Function(Box<ExportedTypeFunction>),
+}
+
+/// Finds all exported types from a give source file
+pub fn type_exports_from_source(code: &str) -> Result<Vec<ExportedTypeKind>> {
     let parsed_module = match full_moon::parse(code) {
         Ok(parsed_code) => parsed_code,
         Err(errors) => bail!(errors
@@ -27,7 +33,12 @@ pub fn type_declarations_from_source(code: &str) -> Result<Vec<ExportedTypeDecla
         .nodes()
         .stmts()
         .filter_map(|stmt| match stmt {
-            Stmt::ExportedTypeDeclaration(stmt) => Some(stmt.clone()),
+            Stmt::ExportedTypeDeclaration(stmt) => {
+                Some(ExportedTypeKind::Declaration(Box::new(stmt.clone())))
+            }
+            Stmt::ExportedTypeFunction(stmt) => {
+                Some(ExportedTypeKind::Function(Box::new(stmt.clone())))
+            }
             _ => None,
         })
         .collect())
@@ -189,21 +200,94 @@ pub fn create_new_type_declaration(
     ExportedTypeDeclaration::new(type_declaration)
 }
 
-// Creates a list of re-exported type declarations from the type declarations found in the source file
-fn re_export_type_declarations(
-    stmts: Vec<ExportedTypeDeclaration>,
-) -> Vec<(Stmt, Option<TokenReference>)> {
+pub fn create_new_type_function_declaration(
+    stmt: &ExportedTypeFunction,
+) -> ExportedTypeDeclaration {
+    let mut lhs_generics = Punctuated::new();
+    let mut rhs_generics = Punctuated::new();
+
+    for (index, pair) in stmt
+        .type_function()
+        .function_body()
+        .parameters()
+        .pairs()
+        .enumerate()
+    {
+        let (parameter, punctuation) = pair.clone().into_tuple();
+
+        let token = match parameter {
+            Parameter::Name(token) => token.with_token(Token::new(TokenType::Identifier {
+                identifier: format!("T{}", index).into(),
+            })),
+
+            // Vararg type function parameters cannot resolve to a generic
+            Parameter::Ellipsis(_) => {
+                continue;
+            }
+            _ => unreachable!(),
+        };
+
+        lhs_generics.push(Pair::new(
+            GenericDeclarationParameter::new(GenericParameterInfo::Name(token.clone())),
+            punctuation.clone(),
+        ));
+        rhs_generics.push(Pair::new(TypeInfo::Basic(token), punctuation));
+    }
+
+    if let (Some(last_lhs), Some(last_rhs)) = (lhs_generics.pop(), rhs_generics.pop()) {
+        lhs_generics.push(Pair::new(last_lhs.into_value(), None));
+        rhs_generics.push(Pair::new(last_rhs.into_value(), None));
+    }
+
+    let type_info = IndexedTypeInfo::Generic {
+        base: stmt.type_function().function_name().clone(),
+        arrows: ContainedSpan::new(
+            TokenReference::symbol("<").unwrap(),
+            TokenReference::symbol(">").unwrap(),
+        ),
+        generics: rhs_generics,
+    };
+
+    let type_declaration = TypeDeclaration::new(
+        stmt.type_function().function_name().clone(),
+        TypeInfo::Module {
+            module: TokenReference::new(
+                vec![],
+                Token::new(TokenType::Identifier {
+                    identifier: "REQUIRED_MODULE".into(),
+                }),
+                vec![],
+            ),
+            punctuation: TokenReference::symbol(".").unwrap(),
+            type_info: Box::new(type_info),
+        },
+    );
+
+    ExportedTypeDeclaration::new(
+        type_declaration.with_generics(Some(GenericDeclaration::new().with_generics(lhs_generics))),
+    )
+}
+
+// Creates a list of re-exported types from the types found in the source file
+fn re_export_types(stmts: Vec<ExportedTypeKind>) -> Vec<(Stmt, Option<TokenReference>)> {
     let known_type_names: Vec<String> = stmts
         .iter()
-        .map(|stmt| stmt.type_declaration().type_name().token().to_string())
+        .map(|stmt| match stmt {
+            ExportedTypeKind::Declaration(stmt) => {
+                stmt.type_declaration().type_name().token().to_string()
+            }
+            ExportedTypeKind::Function(stmt) => {
+                stmt.type_function().function_name().token().to_string()
+            }
+        })
         .collect();
 
     stmts
         .iter()
-        .map(|stmt| {
-            (
+        .map(|stmt| match stmt {
+            ExportedTypeKind::Declaration(decl) => (
                 Stmt::ExportedTypeDeclaration(create_new_type_declaration(
-                    stmt,
+                    decl,
                     known_type_names.clone(),
                 )),
                 Some(TokenReference::new(
@@ -213,7 +297,17 @@ fn re_export_type_declarations(
                     }),
                     vec![],
                 )),
-            )
+            ),
+            ExportedTypeKind::Function(func) => (
+                Stmt::ExportedTypeDeclaration(create_new_type_function_declaration(func)),
+                Some(TokenReference::new(
+                    vec![],
+                    Token::new(TokenType::Whitespace {
+                        characters: "\n".into(),
+                    }),
+                    vec![],
+                )),
+            ),
         })
         .collect()
 }
@@ -274,9 +368,9 @@ pub fn mutate_link(
     return_expressions: Punctuated<Expression>,
     contents: &str,
 ) -> Result<MutateLinkResult> {
-    let type_declarations = type_declarations_from_source(contents)?;
+    let type_exports = type_exports_from_source(contents)?;
 
-    if type_declarations.is_empty() {
+    if type_exports.is_empty() {
         return Ok(MutateLinkResult::Unchanged);
     }
 
@@ -285,7 +379,7 @@ pub fn mutate_link(
         .clone()
         .with_stmts(
             std::iter::once(extract_require_into_local_stmt(return_expressions))
-                .chain(re_export_type_declarations(type_declarations))
+                .chain(re_export_types(type_exports))
                 .collect(),
         )
         .with_last_stmt(Some(create_return_require_variable()));
@@ -312,10 +406,10 @@ mod tests {
             export type Value<T, S = T> = Types.Value<T, S>
         ";
 
-        let type_declarations = type_declarations_from_source(code).unwrap();
+        let type_declarations = type_exports_from_source(code).unwrap();
         assert_eq!(type_declarations.len(), 1);
 
-        let reexported_type_declarations = re_export_type_declarations(type_declarations);
+        let reexported_type_declarations = re_export_types(type_declarations);
         assert_eq!(reexported_type_declarations.len(), 1);
 
         assert_eq!(
@@ -330,10 +424,10 @@ mod tests {
             export type Value<T, S = Object> = Types.Value<T, S>
         ";
 
-        let type_declarations = type_declarations_from_source(code).unwrap();
+        let type_declarations = type_exports_from_source(code).unwrap();
         assert_eq!(type_declarations.len(), 1);
 
-        let reexported_type_declarations = re_export_type_declarations(type_declarations);
+        let reexported_type_declarations = re_export_types(type_declarations);
         assert_eq!(reexported_type_declarations.len(), 1);
 
         assert_eq!(
@@ -348,10 +442,10 @@ mod tests {
             export type Value<T, S = unknown> = Types.Value<T, S>
         ";
 
-        let type_declarations = type_declarations_from_source(code).unwrap();
+        let type_declarations = type_exports_from_source(code).unwrap();
         assert_eq!(type_declarations.len(), 1);
 
-        let reexported_type_declarations = re_export_type_declarations(type_declarations);
+        let reexported_type_declarations = re_export_types(type_declarations);
         assert_eq!(reexported_type_declarations.len(), 1);
 
         assert_eq!(
@@ -367,10 +461,10 @@ mod tests {
             export type Value<T, S = Action> = Types.Value<T, S>
         ";
 
-        let type_declarations = type_declarations_from_source(code).unwrap();
+        let type_declarations = type_exports_from_source(code).unwrap();
         assert_eq!(type_declarations.len(), 2);
 
-        let reexported_type_declarations = re_export_type_declarations(type_declarations);
+        let reexported_type_declarations = re_export_types(type_declarations);
         assert_eq!(reexported_type_declarations.len(), 2);
 
         assert_eq!(
@@ -385,10 +479,10 @@ mod tests {
             export type Remote<Args... = ...any> = Types.Remote<Args...>
         ";
 
-        let type_declarations = type_declarations_from_source(code).unwrap();
+        let type_declarations = type_exports_from_source(code).unwrap();
         assert_eq!(type_declarations.len(), 1);
 
-        let reexported_type_declarations = re_export_type_declarations(type_declarations);
+        let reexported_type_declarations = re_export_types(type_declarations);
         assert_eq!(reexported_type_declarations.len(), 1);
 
         assert_eq!(
@@ -403,15 +497,75 @@ mod tests {
             export type Producer<State = any, Dispatchers = ExternalType> = Types.Producer<State, Dispatchers>
         ";
 
-        let type_declarations = type_declarations_from_source(code).unwrap();
+        let type_declarations = type_exports_from_source(code).unwrap();
         assert_eq!(type_declarations.len(), 1);
 
-        let reexported_type_declarations = re_export_type_declarations(type_declarations);
+        let reexported_type_declarations = re_export_types(type_declarations);
         assert_eq!(reexported_type_declarations.len(), 1);
 
         assert_eq!(
             reexported_type_declarations[0].0.to_string(),
             "export type Producer<State , Dispatchers > = REQUIRED_MODULE.Producer<State , Dispatchers >"
+        );
+    }
+
+    #[test]
+    fn re_exports_type_functions() {
+        let code = "
+            export type function keyof(a, b)
+            
+            end
+        ";
+
+        let type_exports = type_exports_from_source(code).unwrap();
+        assert_eq!(type_exports.len(), 1);
+
+        let reexported_types = re_export_types(type_exports);
+        assert_eq!(reexported_types.len(), 1);
+
+        assert_eq!(
+            reexported_types[0].0.to_string(),
+            "export type keyof<T0, T1> = REQUIRED_MODULE.keyof<T0, T1>"
+        );
+    }
+
+    #[test]
+    fn re_exports_type_functions_with_ellipsis_parameter() {
+        let code = "
+            export type function keyof(a, b, ...)
+            
+            end
+        ";
+
+        let type_exports = type_exports_from_source(code).unwrap();
+        assert_eq!(type_exports.len(), 1);
+
+        let reexported_types = re_export_types(type_exports);
+        assert_eq!(reexported_types.len(), 1);
+
+        assert_eq!(
+            reexported_types[0].0.to_string(),
+            "export type keyof<T0, T1> = REQUIRED_MODULE.keyof<T0, T1>"
+        );
+    }
+
+    #[test]
+    fn re_exports_type_functions_with_only_ellipsis_parameter() {
+        let code = "
+            export type function keyof(...)
+            
+            end
+        ";
+
+        let type_exports = type_exports_from_source(code).unwrap();
+        assert_eq!(type_exports.len(), 1);
+
+        let reexported_types = re_export_types(type_exports);
+        assert_eq!(reexported_types.len(), 1);
+
+        assert_eq!(
+            reexported_types[0].0.to_string(),
+            "export type keyof<> = REQUIRED_MODULE.keyof<>"
         );
     }
 }
@@ -425,8 +579,8 @@ mod extra_tests {
         let code = r"
             export type Value<T = string?> = Types.Value<T>
         ";
-        let type_declarations = type_declarations_from_source(code).unwrap();
-        let reexported = re_export_type_declarations(type_declarations);
+        let type_declarations = type_exports_from_source(code).unwrap();
+        let reexported = re_export_types(type_declarations);
         println!("Optional: {}", reexported[0].0.to_string());
     }
 
@@ -435,8 +589,8 @@ mod extra_tests {
         let code = r"
             export type Value<T = string | number> = Types.Value<T>
         ";
-        let type_declarations = type_declarations_from_source(code).unwrap();
-        let reexported = re_export_type_declarations(type_declarations);
+        let type_declarations = type_exports_from_source(code).unwrap();
+        let reexported = re_export_types(type_declarations);
         println!("Union: {}", reexported[0].0.to_string());
     }
 
@@ -445,8 +599,8 @@ mod extra_tests {
         let code = r"
             export type Value<T... = ...string> = Types.Value<T...>
         ";
-        let type_declarations = type_declarations_from_source(code).unwrap();
-        let reexported = re_export_type_declarations(type_declarations);
+        let type_declarations = type_exports_from_source(code).unwrap();
+        let reexported = re_export_types(type_declarations);
         println!("VariadicPack: {}", reexported[0].0.to_string());
     }
 
@@ -455,8 +609,8 @@ mod extra_tests {
         let code = r"
             export type AsyncRemote<Args... = ...any, Returns... = ...any> = Types.AsyncRemote<Args..., Returns...>
         ";
-        let type_declarations = type_declarations_from_source(code).unwrap();
-        let reexported = re_export_type_declarations(type_declarations);
+        let type_declarations = type_exports_from_source(code).unwrap();
+        let reexported = re_export_types(type_declarations);
         println!("MultiVariadic: {}", reexported[0].0.to_string());
     }
 }
