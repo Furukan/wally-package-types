@@ -492,6 +492,96 @@ mod tests {
     }
 
     #[test]
+    fn re_exports_multiple_variadic_generic_defaults() {
+        let code = r"
+            export type AsyncRemote<Args... = ...any, Returns... = ...any> = Types.AsyncRemote<Args..., Returns...>
+        ";
+
+        let type_declarations = type_exports_from_source(code).unwrap();
+        assert_eq!(type_declarations.len(), 1);
+
+        let reexported_type_declarations = re_export_types(type_declarations);
+        assert_eq!(reexported_type_declarations.len(), 1);
+
+        assert_eq!(
+            reexported_type_declarations[0].0.to_string(),
+            "export type AsyncRemote<Args... = ...any, Returns... = ...any> = REQUIRED_MODULE.AsyncRemote<Args... , Returns... >"
+        );
+    }
+
+    #[test]
+    fn re_exports_variadic_pack_generic_defaults() {
+        let code = r"
+            export type Value<T... = ...string> = Types.Value<T...>
+        ";
+
+        let type_declarations = type_exports_from_source(code).unwrap();
+        assert_eq!(type_declarations.len(), 1);
+
+        let reexported_type_declarations = re_export_types(type_declarations);
+        assert_eq!(reexported_type_declarations.len(), 1);
+
+        assert_eq!(
+            reexported_type_declarations[0].0.to_string(),
+            "export type Value<T... = ...string> = REQUIRED_MODULE.Value<T... >"
+        );
+    }
+
+    #[test]
+    fn re_exports_optional_generic_defaults() {
+        let code = r"
+            export type Value<T = string?> = Types.Value<T>
+        ";
+
+        let type_declarations = type_exports_from_source(code).unwrap();
+        assert_eq!(type_declarations.len(), 1);
+
+        let reexported_type_declarations = re_export_types(type_declarations);
+        assert_eq!(reexported_type_declarations.len(), 1);
+
+        assert_eq!(
+            reexported_type_declarations[0].0.to_string(),
+            "export type Value<T = string?> = REQUIRED_MODULE.Value<T >"
+        );
+    }
+
+    #[test]
+    fn re_exports_union_generic_defaults() {
+        let code = r"
+            export type Value<T = string | number> = Types.Value<T>
+        ";
+
+        let type_declarations = type_exports_from_source(code).unwrap();
+        assert_eq!(type_declarations.len(), 1);
+
+        let reexported_type_declarations = re_export_types(type_declarations);
+        assert_eq!(reexported_type_declarations.len(), 1);
+
+        assert_eq!(
+            reexported_type_declarations[0].0.to_string(),
+            "export type Value<T = string | number> = REQUIRED_MODULE.Value<T >"
+        );
+    }
+
+    #[test]
+    fn does_not_re_export_union_generic_defaults_with_unknown_types() {
+        let code = r"
+            export type Value<T = string | Object> = Types.Value<T>
+        ";
+
+        let type_declarations = type_exports_from_source(code).unwrap();
+        assert_eq!(type_declarations.len(), 1);
+
+        let reexported_type_declarations = re_export_types(type_declarations);
+        assert_eq!(reexported_type_declarations.len(), 1);
+
+        assert_eq!(
+            reexported_type_declarations[0].0.to_string(),
+            "export type Value<T > = REQUIRED_MODULE.Value<T >"
+        );
+    }
+
+    #[test]
     fn strips_earlier_defaults_when_later_param_has_unknown_default() {
         let code = r"
             export type Producer<State = any, Dispatchers = ExternalType> = Types.Producer<State, Dispatchers>
@@ -567,50 +657,5 @@ mod tests {
             reexported_types[0].0.to_string(),
             "export type keyof<> = REQUIRED_MODULE.keyof<>"
         );
-    }
-}
-
-#[cfg(test)]
-mod extra_tests {
-    use super::*;
-
-    #[test]
-    fn test_optional_default() {
-        let code = r"
-            export type Value<T = string?> = Types.Value<T>
-        ";
-        let type_declarations = type_exports_from_source(code).unwrap();
-        let reexported = re_export_types(type_declarations);
-        println!("Optional: {}", reexported[0].0.to_string());
-    }
-
-    #[test]
-    fn test_union_default() {
-        let code = r"
-            export type Value<T = string | number> = Types.Value<T>
-        ";
-        let type_declarations = type_exports_from_source(code).unwrap();
-        let reexported = re_export_types(type_declarations);
-        println!("Union: {}", reexported[0].0.to_string());
-    }
-
-    #[test]
-    fn test_variadic_pack_default() {
-        let code = r"
-            export type Value<T... = ...string> = Types.Value<T...>
-        ";
-        let type_declarations = type_exports_from_source(code).unwrap();
-        let reexported = re_export_types(type_declarations);
-        println!("VariadicPack: {}", reexported[0].0.to_string());
-    }
-
-    #[test]
-    fn test_multiple_variadic_defaults() {
-        let code = r"
-            export type AsyncRemote<Args... = ...any, Returns... = ...any> = Types.AsyncRemote<Args..., Returns...>
-        ";
-        let type_declarations = type_exports_from_source(code).unwrap();
-        let reexported = re_export_types(type_declarations);
-        println!("MultiVariadic: {}", reexported[0].0.to_string());
     }
 }
