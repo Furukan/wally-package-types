@@ -94,6 +94,8 @@ jobs:
 
   release_cargo:
     name: Publish to cargo
+    # The crates.io package belongs to upstream; forks have no token to publish it
+    if: github.repository == 'JohnnyMorganz/wally-package-types'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
